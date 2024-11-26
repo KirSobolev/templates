@@ -1,0 +1,12 @@
+numpy==2.0
+pandas
+tensorflow
+fancyimpute
+phik
+prophet
+plotly
+xgboost
+optuna
+lime
+shap
+seaborn
