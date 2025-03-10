@@ -42,15 +42,25 @@ class BaseBenchmark:
     Methods:
     --------
     split_data():
-        Splits the data into X_train, X_test, y_train, y_test as well as scaled versions X_train and X_test.
+        Scales the X data. Does not scale provided categorical variables. Returns tuple with X-test/train and y-test/train data.
     get_default_models() -> dict:
         Returns a list of default supported models.
     train_and_evaluate():
         Cycles through model dict, trains the model evaluates models by calling evaluate_model() and saves the results.
     evaluate_model(evaluate_model(self, name: str, predictions, execution_time) -> dict):
         Evaluates model and returns a dictionary with metrics
-    benchamrking():
-        Runs train_and_evaluate() and print out the result.
+    optimize(self, trial, models: dict) -> dict
+        Function that optimizes one model at a time. Returns a dictionary with model's best hyperparameters
+    benchamrking(optimization_direction):
+        Runs train_and_evaluate() and optimization().
+    optimization(self, direction: str)
+        Runs through the model list, optimizes them and saves the metrics to self.results
+     mean_scores(self, model, X_train, y_train)
+        Method used by optuna to evaluate the model while optimizing
+    get_hyperparameters(self, trial, model_name : str) -> dict
+        Returns dictionary with model's supported hyperparameters.
+    print_results(self)
+        Prints out self.results
 
     """
     def __init__(self, df: pd.DataFrame, 
@@ -89,19 +99,23 @@ class BaseBenchmark:
         self.models = models if models is not None else self.get_default_models()
         self.results = pd.DataFrame()
 
-
     def split_data(self) -> tuple:
-        """Splits the dataset into training and testing sets and applies scaling of choice"""
+        """Splits the dataset into training and testing sets and applies scaling of choice to all other columns except one presented in categorical_variables"""
+        # X is everything else but target variable
         X = self.df.drop(columns=[self.target_col])
+        # y is only target variable. Don't usually need to be scaled
         y = self.df[self.target_col]
-        categorical_columns = self.categorical_variables
         def apply_scailing():
+            """Applies scaling to X data"""
+            # Parse for numerical columns only
             numerical_cols = X.select_dtypes(include=['number']).columns
-            if categorical_columns is None:
+            if self.categorical_variables is None:
+                # Apply to every numerical column if categorical_variables is not provided
                 cols_to_scale = [col for col in numerical_cols]
             else:
-                cols_to_scale = [col for col in numerical_cols if col not in categorical_columns]
-            # Applying MinMaxScaler to selected columns
+                # Leave categorical_variables as they are
+                cols_to_scale = [col for col in numerical_cols if col not in self.categorical_variables]
+            # Applying Scaler to selected columns
             X[cols_to_scale] = self.scaler_X.fit_transform(X[cols_to_scale])
 
         apply_scailing()
@@ -114,15 +128,17 @@ class BaseBenchmark:
         raise NotImplementedError
 
     def optimize(self, trial, models: dict) -> dict:
-        """To be implemented by subclasses. Should provide dict with hyperparameters for selected models"""
+        """To be implemented by subclasses. Should provide dict with best hyperparameters for selected model
+        Attributes
+        ----------
+        """
         raise NotImplementedError
     
     def train_and_evaluate(self) -> None:
-        """Trains models and evaluates them."""
-        metrics_data = []
+        """Trains models one by one and evaluates them."""
         for name, model in self.models.items():
             try:
-                predictions = None
+                # Measure execution time
                 start_time = time.time()
                 logging.info(f"Training {name}...")
 
@@ -154,7 +170,7 @@ class BaseBenchmark:
                 
                 # CatBoost requires list of categorical variables
                 elif name == "CatBoostRegressor" or name == "CatBoostClassifier":
-                    # CatBoost doesn't work well with scaling, because it messes up cat_features
+                    # If provided categorical columns it runs CatBoost
                     if self.categorical_variables:
                         model = model(verbose=0)
                         model.fit(self.X_train, self.y_train, cat_features=self.categorical_variables)
@@ -164,40 +180,56 @@ class BaseBenchmark:
                 else:
                     model = model()
                     model.fit(self.X_train, self.y_train)
-                    
+                
+                # Mesure time to complete training
                 execution_time = (time.time() - start_time) * 1000  # Convert to ms
 
                 predictions = model.predict(self.X_test)
                 
                 # Get and save the metrics to the list
                 metrics_row = self.evaluate_model(name, predictions, execution_time)
+                # Reformat to pandas dataframe
                 metrics_row = pd.DataFrame(metrics_row)
                 metrics_row["Model"] = name
+                # Append new row with metrics to the resulting dataframe
                 self.results = pd.concat([self.results, metrics_row], ignore_index=True)    
 
             except Exception as e:
                 logging.error(f"{name}: {e}")
                 continue
 
-
     def optimization(self, direction: str):
-
+        """Runs complete optimization pipeline
+           Attributes
+           ----------
+           direction: str
+                Supported are only maximize for classification problems and minimize for regression
+        """
         def optimize_model(model_name):
+            """Optimizes single model and appends metrics into self.results"""
             logging.info(f"Starting optimizing {model_name}...")
             
             def objective(trial):
+                # Get possible parameters for model
                 params = self.get_hyperparameters(trial=trial, model_name=model_name)
+                # Unpack model and parameters
                 model = self.models[model_name](**params)
+                # Evaluate model
                 score = self.mean_scores(model, self.X_train, self.y_train)
-                return score  # Optuna will minimize this
+                return score  # Optuna will utilize this
 
-            study = optuna.create_study(direction=direction)  # Minimizing MSE
+            # Create optuna study with random name on local storage
+            # Direction minimize for regression problems and maximize for calssification
+            study = optuna.create_study(direction=direction) 
+            # Turn off optuna verbosity
             optuna.logging.set_verbosity(optuna.logging.ERROR)
+            # Time mesurement
             start_time = time.time()
+            # Find best parameters
             study.optimize(objective, n_trials=30)
-
             logging.info(f"Best params for {model_name}: {study.best_params}")
             best_params = study.best_params
+            # Train final model with best parameters
             final_model = self.models[model_name](**best_params)
             final_model.fit(self.X_train, self.y_train)  # Train on full training data
             execution_time = (time.time() - start_time) * 1000
@@ -208,7 +240,9 @@ class BaseBenchmark:
             metrics_row = self.evaluate_model(model_name, predictions, execution_time=execution_time)
             metrics_row = pd.DataFrame(metrics_row)
             metrics_row["Model"] = "Optimized " + model_name
-            self.results = pd.concat([self.results, metrics_row], ignore_index=True)       
+            self.results = pd.concat([self.results, metrics_row], ignore_index=True)
+
+        # Run for each model in models dict.  
         for model_name in self.models.keys():
             optimize_model(model_name)
     
@@ -229,13 +263,33 @@ class BaseBenchmark:
         raise NotImplementedError
     
     def mean_scores(self, model, X_train, y_train):
+        """Utilizes cros_val_score and returns mean value of scores.
+        Attributes
+        ----------
+        model
+            Actual model with parameters
+        X_train
+            Train X data
+        y_train
+            Train y data"""
         raise NotImplementedError
     
-    def get_hyperparameters(self, trial, model_name : str):
+    def get_hyperparameters(self, trial, model_name: str):
+        """Returns a dictionary with supported hyperparameters for the model in question.
+        Attributes
+        -----------
+        trial
+            Optuna required parameter
+        model_name: str
+            Name of the model. Should be in the list of suppoorted models"""
         raise NotImplementedError
 
     def benchmark(self, optimization_direction=None):
-        """Runs the benchmarking process."""
+        """Runs the benchmarking process. First runs normal benchmarking, then tries to optimize same models in case if optimization direction provided.
+        Attributes
+        ----------
+        optimization_direction
+            Should be minimize for regression problems or maximize for classification. In case if not provided or invalid skips iptimization phase."""
         self.train_and_evaluate()
         if optimization_direction in ["maximize", "minimize"]:
             self.optimization(direction=optimization_direction)
@@ -244,11 +298,14 @@ class BaseBenchmark:
         print("Benchmarking completed.")
 
     def print_results(self):
+        """"Prints out self.results"""
         print(self.results.to_markdown())
+
 
 class RegressionBenchmark(BaseBenchmark):
     def get_default_models(self) -> dict:
-        """Returns default regression models."""
+        """Returns default regression models of such algorithms:
+        Linear Regression, SVR, Random Forest, XGB, LGBM, KNN, CatBoost"""
         return {
             "LinearRegression": LinearRegression,
             "SVR": svm.SVR,
@@ -261,14 +318,15 @@ class RegressionBenchmark(BaseBenchmark):
     
     def get_hyperparameters(self, trial, model_name : str):
             """
-            Gets hyperparameters of the model by model name in Optuna required format
+            Gets hyperparameters of the model by model name in Optuna required format. Supported model names:
+            LinearRegression, SVR, RandomForestRegressor, XGBRegressor, LGBMRegressor, KNNRegressor, CatBoostRegressor
             
             Attributes:
             ----------
             trial
                 Optuna required
-            model_name
-                Name of the model. Should be in supported list
+            model_name: str
+                Name of the model. Should be in the list of suppoorted models
             """
             if model_name == "LinearRegression":
                 return {}  # No hyperparameters to tune for basic LinearRegression
@@ -323,8 +381,17 @@ class RegressionBenchmark(BaseBenchmark):
                     "verbose": False
                 }
         
-    # Evaluation function using cross-validation
     def mean_scores(self, model, X_train, y_train):
+        """Utilizes cros_val_score and returns mean value of scores. Uses negative mean squared error.
+
+        Attributes
+        ----------
+        model
+            Actual model with parameters
+        X_train
+            Train X data
+        y_train
+            Train y data"""
         scores = cross_val_score(model, X_train, y_train, cv=5, scoring="neg_mean_squared_error")
         return np.mean(scores)  # Optuna minimizes, so MSE is negated
     
@@ -343,8 +410,12 @@ class RegressionBenchmark(BaseBenchmark):
             "Time (ms)": [round(execution_time, 2)],
         }
 
+
 class ClassificationBenchmark(BaseBenchmark):
     def get_default_models(self):
+        """Returns default classification models of such algorithms:
+        Logistic Regression, SVC, Random Forest, XGB, LGBM, KNN, CatBoost"""
+
         return {
             "LogisticRegression": LogisticRegression,
             "SVC": svm.SVC,
@@ -356,10 +427,30 @@ class ClassificationBenchmark(BaseBenchmark):
         }
 
     def mean_scores(self, model, X_train, y_train):
+        """Utilizes cros_val_score and returns mean value of scores. Uses accuracy.
+        Attributes
+        ----------
+        model
+            Actual model with parameters
+        X_train
+            Train X data
+        y_train
+            Train y data"""
         scores = cross_val_score(model, X_train, y_train, cv=5, scoring="accuracy")
         return np.mean(scores)  # Higher accuracy is better
     
     def get_hyperparameters(self, trial, model_name : str):
+        """
+            Gets hyperparameters of the model by model name in Optuna required format. Supported model names:
+            LogisticRegression, SVC, RandomForestClassifier, XGBClassifier, LGBMClassifier, KNNClassifier, CatBoostClassifier
+            
+            Attributes:
+            ----------
+            trial
+                Optuna required
+            model_name: str
+                Name of the model. Should be in the list of suppoorted models
+            """
         if model_name == "LogisticRegression":
             return {
                 "C": trial.suggest_float("C", 1e-3, 10, log=True),
@@ -428,8 +519,6 @@ class ClassificationBenchmark(BaseBenchmark):
             "Time (ms)": [round(execution_time, 2)],
         }
 
-
-# TODO: Add optimization feature.
 
 if __name__=="__main__":
     print("Module is supposed to be imported")
