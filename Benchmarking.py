@@ -1,12 +1,15 @@
 import pandas as pd
 import numpy as np
 import optuna
-
+import joblib
 
 import time
 import logging
 
 from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
+# Models
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn import metrics, svm
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -14,8 +17,7 @@ from xgboost import XGBRegressor, XGBClassifier
 from lightgbm import LGBMRegressor, LGBMClassifier
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from catboost import CatBoostClassifier, CatBoostRegressor
-from sklearn.metrics import classification_report
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -136,54 +138,54 @@ class BaseBenchmark:
     
     def train_and_evaluate(self) -> None:
         """Trains models one by one and evaluates them."""
+        # Initialize fit parameters dict so code works for every model
+        fit_params = {}
         for name, model in self.models.items():
             try:
                 # Measure execution time
                 start_time = time.time()
                 logging.info(f"Training {name}...")
 
-                # KNN algorithm need N-neighbors number. This calculates it
+                # KNN algorithm need N-neighbors number.
                 if name == "KNNRegressor" or name == "KNNClassifier":
-                    max_iterations = 70
-                    error = []
-                    # Calculating error for K values between 1 and 40
-                    for i in range(1, max_iterations):
-                        # try with current k-value, train the model and make a test prediction
-                        knn = model(n_neighbors=i, metric="minkowski")
-                        knn.fit(self.X_train, self.y_train)
-                        pred_i = knn.predict(self.X_test)
-                        # save the error value for this k-value
-                        if name == "KNNRegressor":
-                            error.append(np.sqrt(metrics.mean_squared_error(self.y_test, pred_i)))
-                        elif name == "KNNClassifier":
-                            error.append(np.mean(pred_i != self.y_test))
-                    # K value
-                    k_value = np.argmin(error) + 1
+                    def calculate_k_value(max_iter=70):
+                        """Calculates best K value"""
+                        error = []
+                        # Calculating error for K values between 1 and 40
+                        for i in range(1, max_iter):
+                            # try with current k-value, train the model and make a test prediction
+                            knn = model(n_neighbors=i, metric="minkowski")
+                            knn.fit(self.X_train, self.y_train)
+                            pred_i = knn.predict(self.X_test)
+                            # save the error value for this k-value
+                            if name == "KNNRegressor":
+                                error.append(np.sqrt(metrics.mean_squared_error(self.y_test, pred_i)))
+                            elif name == "KNNClassifier":
+                                error.append(np.mean(pred_i != self.y_test))
+                        # K value
+                        k_value = np.argmin(error) + 1
+                        return k_value
                     # Actual KNN model training
-                    model = model(n_neighbors=k_value, metric="minkowski")
-                    model.fit(self.X_train, self.y_train)
+                    model = model(n_neighbors=calculate_k_value(), metric="minkowski")
                     
-                # LGBM requires objective parameter, also it is nice to turn off verbose.
-                elif name == "LGBMRegressor":
-                    model = model(objective="regression", verbose=0)
-                    model.fit(self.X_train, self.y_train)
+                # Turn off verbose.
+                elif name == "LGBMRegressor" or name== "LGBMClassifier":
+                    model = model(verbose=0)
                 
-                # CatBoost requires list of categorical variables
+                # CatBoost wants list of categorical variables
                 elif name == "CatBoostRegressor" or name == "CatBoostClassifier":
-                    # If provided categorical columns it runs CatBoost
-                    if self.categorical_variables:
-                        model = model(verbose=0)
-                        model.fit(self.X_train, self.y_train, cat_features=self.categorical_variables)
-                    else:
-                        logging.info("Categorical variable list was not provided. Skipping CatBoost model...")
-                        continue
+                    model = model(verbose=0)
+                    fit_params = {"cat_features" : self.categorical_variables}
                 else:
                     model = model()
-                    model.fit(self.X_train, self.y_train)
-                
+
+                model.fit(self.X_train, self.y_train, **fit_params)
                 # Mesure time to complete training
                 execution_time = (time.time() - start_time) * 1000  # Convert to ms
-
+                # Save the model
+                model_path = f"trained_models/{name}"
+                joblib.dump(model, model_path)
+                # Make predictions
                 predictions = model.predict(self.X_test)
                 
                 # Get and save the metrics to the list
@@ -227,19 +229,29 @@ class BaseBenchmark:
             start_time = time.time()
             # Find best parameters
             study.optimize(objective, n_trials=30)
-            logging.info(f"Best params for {model_name}: {study.best_params}")
             best_params = study.best_params
+            # Turn off verbose for catboost last training as well
+            if model_name=="CatBoostRegressor" or model_name=="CatBoostClassifier":
+                best_params["verbose"] = 0
+            logging.info(f"Best params for {model_name}: {best_params}")
             # Train final model with best parameters
             final_model = self.models[model_name](**best_params)
             final_model.fit(self.X_train, self.y_train)  # Train on full training data
             execution_time = (time.time() - start_time) * 1000
 
+            # Make predictions
             predictions = final_model.predict(self.X_test)
                 
             # Get and save the metrics to the list
             metrics_row = self.evaluate_model(model_name, predictions, execution_time=execution_time)
             metrics_row = pd.DataFrame(metrics_row)
-            metrics_row["Model"] = "Optimized " + model_name
+            model_name = "Optimized_" + model_name
+            # Save the model
+            model_path = f"trained_models/{model_name}"
+            joblib.dump(final_model, model_path)
+            # Update name in metrics row
+            metrics_row["Model"] = model_name
+            # Concatenate with the rest of metrics
             self.results = pd.concat([self.results, metrics_row], ignore_index=True)
 
         # Run for each model in models dict.  
@@ -519,6 +531,7 @@ class ClassificationBenchmark(BaseBenchmark):
             "Time (ms)": [round(execution_time, 2)],
         }
 
+# TODO: PROVIDE BETTER PARAMETER GRIDS, add AdaBoost
 
 if __name__=="__main__":
     print("Module is supposed to be imported")
